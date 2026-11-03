@@ -9,7 +9,8 @@ C 盘安全清理工具 — GUI 增强版 (tkinter，零第三方依赖)
   3. 内存&进程  —— 实时内存 / 磁盘曲线 + 后台进程占用排行 + 安全结束进程
   4. 自动清理   —— 定时规则（Windows 计划任务）+ 静默 --autorun 模式
   5. 排除设置   —— 图形化维护保留路径 / 模式，写回 cleanup_config.ini
-  6. 报告       —— 清理前后对比，导出 TXT + HTML（含柱状图）
+  6. 深度清理   —— DISM 组件存储(WinSxS) / 休眠文件 hiberfil.sys / 系统磁盘清理
+  7. 报告       —— 清理前后对比，导出 TXT + HTML（含柱状图）
 
 安全模型（全模块统一，不可由配置放宽）：
   A. 扫描白名单   —— 只收集明确列出的临时 / 缓存目录内的文件；
@@ -34,9 +35,11 @@ import glob
 import ctypes
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 APP_NAME = "CleanCDrive"
-APP_TITLE = "C 盘安全清理工具 · 增强版"
+APP_VERSION = "1.2.0"
+APP_TITLE = "C 盘安全清理工具 · 增强版 v%s" % APP_VERSION
 TASK_NAME = "CleanCDrive_AutoClean"
 
 # 计划任务频率：界面上显示中文，写回配置时翻成 Windows 认识的关键字。
@@ -147,6 +150,22 @@ APP_CACHE_DEFS = [
     ("Adobe 媒体缓存", "%LOCALAPPDATA%\\Adobe\\Common\\Media Cache Files", ["*"]),
     ("Adobe 媒体缓存旧", "%LOCALAPPDATA%\\Adobe\\Common\\Media Cache", ["*"]),
     ("传递优化缓存", "C:\\ProgramData\\Microsoft\\Windows\\DeliveryOptimization\\Cache", ["*"]),
+    # ---- v1.2 新增：着色器 / 错误报告 / 开发工具等常见空间大头 ----
+    # 说明：路径不存在的条目 glob 结果为空，只会安静跳过，不会误删任何东西。
+    ("微信4.0 日志", "%USERPROFILE%\\Documents\\xwechat_files\\*\\log", ["*.log", "*.txt"]),
+    ("崩溃转储", "%LOCALAPPDATA%\\CrashDumps", ["*"]),
+    ("WER 错误报告队列", "%LOCALAPPDATA%\\Microsoft\\Windows\\WER\\ReportQueue", ["*"]),
+    ("WER 错误报告存档", "%LOCALAPPDATA%\\Microsoft\\Windows\\WER\\ReportArchive", ["*"]),
+    ("DirectX 着色器缓存", "%LOCALAPPDATA%\\D3DSCache", ["*"]),
+    ("NVIDIA DX缓存", "%LOCALAPPDATA%\\NVIDIA\\DXCache", ["*"]),
+    ("NVIDIA 光照缓存", "%LOCALAPPDATA%\\NVIDIA Corporation\\NV_Cache", ["*"]),
+    ("AMD 着色器缓存", "%LOCALAPPDATA%\\AMD\\DxCache", ["*"]),
+    ("AMD 着色器缓存2", "%LOCALAPPDATA%\\AMD\\DxcCache", ["*"]),
+    ("Java 部署缓存", "%USERPROFILE%\\AppData\\LocalLow\\Sun\\Java\\Deployment\\cache", ["*"]),
+    ("VS Code 缓存", "%APPDATA%\\Code\\Cache", ["*"]),
+    ("VS Code 代码缓存", "%APPDATA%\\Code\\CachedData", ["*"]),
+    ("VS Code 日志", "%APPDATA%\\Code\\logs", ["*.log"]),
+    ("Steam 界面缓存", "%LOCALAPPDATA%\\Steam\\htmlcache", ["*"]),
 ]
 
 # ---------------------------------------------------------------------------
@@ -455,7 +474,13 @@ def scan_root(root, patterns, cfg):
 
 
 def build_categories(cfg):
-    categories = []
+    """收集全部可清理分类并并行扫描。
+
+    先把所有待扫描任务（系统临时 / 自定义根 / 应用缓存）收集成清单，
+    再交给线程池并行执行：目录遍历是 IO 密集操作，机械盘或杀软实时
+    扫描会把串行耗时成倍放大，并行后首次扫描明显更快。
+    """
+    jobs = []   # (名称, 根目录, 文件模式, kind)
     excl = [os.path.expandvars(x).rstrip("\\") for x in cfg["exclude_roots"]]
     for r in DEFAULT_SAFE_ROOTS:
         er = os.path.expandvars(r)
@@ -465,17 +490,11 @@ def build_categories(cfg):
         if er in excl:
             continue
         if os.path.isdir(er):
-            files, total, count = scan_root(er, None, cfg)
-            categories.append({
-                "name": "系统临时: " + r, "root": er, "files": files,
-                "total": total, "count": count, "kind": "system"})
+            jobs.append(("系统临时: " + r, er, None, "system"))
     for r in cfg["add_roots"]:
         er = os.path.expandvars(r).rstrip("\\")
         if er and os.path.isdir(er):
-            files, total, count = scan_root(er, None, cfg)
-            categories.append({
-                "name": "自定义根: " + er, "root": er, "files": files,
-                "total": total, "count": count, "kind": "system"})
+            jobs.append(("自定义根: " + er, er, None, "system"))
     if cfg["appcache_enabled"]:
         for name, pattern, patterns in APP_CACHE_DEFS:
             if name in cfg["exclude_apps"]:
@@ -497,11 +516,18 @@ def build_categories(cfg):
                         break
                 if skip:
                     continue
-                files, total, count = scan_root(dnorm, patterns, cfg)
-                categories.append({
-                    "name": "应用缓存: " + name, "root": dnorm, "files": files,
-                    "total": total, "count": count, "kind": "app"})
-    return categories
+                jobs.append(("应用缓存: " + name, dnorm, patterns, "app"))
+    if not jobs:
+        return []
+    cats = []
+    with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as ex:
+        # ex.map 保持任务顺序，zip 后逐个装回分类字典，结果与串行版完全一致
+        for (name, root, _pats, kind), (files, total, count) in zip(
+                jobs, ex.map(lambda j: scan_root(j[1], j[2], cfg), jobs)):
+            cats.append({
+                "name": name, "root": root, "files": files,
+                "total": total, "count": count, "kind": kind})
+    return cats
 
 
 def get_recycle_bin():
@@ -649,12 +675,13 @@ FOF_NOERRORUI = 0x0400
 
 
 def recycle_paths(paths):
-    """把文件送入回收站（可还原），返回 (成功数, 失败数)。"""
-    ok = fail = 0
-    batch = []
-    for p in paths:
-        if os.path.exists(p):
-            batch.append(p)
+    """把文件送入回收站（可还原），返回 (成功数, 失败数)。
+
+    成功与否按「文件是否真的消失」逐一核对：SHFileOperationW 只返回整体
+    结果码，部分文件被占用删不掉时整体码可能仍为 0，按返回码计数会把
+    失败也记成成功，这里改为按实际结果统计。
+    """
+    batch = [p for p in paths if os.path.exists(p)]
     if not batch:
         return 0, 0
     # 分批，避免命令行长度 / 缓冲区过大
@@ -669,14 +696,11 @@ def recycle_paths(paths):
         op.pTo = None
         op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
         try:
-            rc = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+            ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
         except Exception:
-            rc = -1
-        if rc == 0 and not op.fAnyOperationsAborted:
-            ok += len(chunk)
-        else:
-            fail += len(chunk)
-    return ok, fail
+            pass
+    done = [p for p in batch if not os.path.exists(p)]
+    return len(done), len(batch) - len(done)
 
 
 # ---------------------------------------------------------------------------
@@ -818,6 +842,47 @@ def scheduled_task_delete():
     script = ("try { Unregister-ScheduledTask -TaskName '%s' "
               "-Confirm:$false -ErrorAction Stop; 'OK' } "
               "catch { 'ERR: ' + $_.Exception.Message }" % TASK_NAME)
+    out, err, _rc = run_powershell(script, timeout=60)
+    txt = (out or "").strip() or (err or "").strip()
+    return txt.startswith("OK"), txt
+
+
+# ---------------------------------------------------------------------------
+# 深度清理：UAC 提权执行 / 休眠文件检测
+# ---------------------------------------------------------------------------
+def is_admin():
+    """当前进程是否以管理员身份运行。"""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def get_hiberfil_size():
+    """读取 C:\\hiberfil.sys 的大小（隐藏系统文件，需 -Force 绕过属性）。
+
+    休眠未开启或文件不存在时返回 0。
+    """
+    out, _err, _rc = run_powershell(
+        "$f = Get-Item -Force -LiteralPath 'C:\\hiberfil.sys' "
+        "-ErrorAction SilentlyContinue; if ($f) { $f.Length } else { '0' }",
+        timeout=30)
+    try:
+        return int((out or "0").strip() or "0")
+    except Exception:
+        return 0
+
+
+def run_elevated_cmd(exe, args):
+    """弹出 UAC 以管理员身份运行 exe（窗口可见，用户能看到执行进度）。
+
+    Start-Process -Verb RunAs：用户点「是」后立即返回 OK（不等执行完），
+    取消 UAC 则返回错误信息。返回 (是否成功启动, 消息)。
+    """
+    exe = exe.replace("'", "''")
+    args = args.replace("'", "''")
+    script = ("try { Start-Process -FilePath '%s' -ArgumentList '%s' -Verb RunAs; 'OK' } "
+              "catch { 'ERR: ' + $_.Exception.Message }" % (exe, args))
     out, err, _rc = run_powershell(script, timeout=60)
     txt = (out or "").strip() or (err or "").strip()
     return txt.startswith("OK"), txt
@@ -2189,7 +2254,7 @@ def start_gui(smoke=False):
             navwrap.pack(fill="x", padx=SP["xl"] - 4, pady=(SP["s"], SP["m"]))
             self.tabs = PillTabs(navwrap,
                                  ["磁盘清理", "大文件扫描", "内存与进程",
-                                  "自动清理", "排除设置"],
+                                  "自动清理", "排除设置", "深度清理"],
                                  command=self._on_tab, outer=BG)
             self.tabs.pack(side="left")
             self.tabs.redraw()
@@ -2214,14 +2279,16 @@ def start_gui(smoke=False):
             self.tab_mem = tk.Frame(self.stack, bg=PAGE)
             self.tab_auto = tk.Frame(self.stack, bg=PAGE)
             self.tab_excl = tk.Frame(self.stack, bg=PAGE)
+            self.tab_deep = tk.Frame(self.stack, bg=PAGE)
             for t in (self.tab_disk, self.tab_big, self.tab_mem,
-                      self.tab_auto, self.tab_excl):
+                      self.tab_auto, self.tab_excl, self.tab_deep):
                 self.stack.add(t)
             self._build_disk_tab()
             self._build_big_tab()
             self._build_mem_tab()
             self._build_auto_tab()
             self._build_excl_tab()
+            self._build_deep_tab()
             self.stack.show(0)
 
         def _logo(self, parent):
@@ -2243,6 +2310,8 @@ def start_gui(smoke=False):
                 pass
             if idx == 2:
                 self.refresh_procs()
+            if idx == 5:
+                self._refresh_deep()
 
         def _refresh_disk(self):
             f, t = get_disk_free("C")
@@ -3326,6 +3395,123 @@ def start_gui(smoke=False):
             else:
                 messagebox.showwarning("保存失败", "无法写入配置文件，请检查权限：\n%s" % self.ini)
 
+        # ==================== Tab 6：深度清理 ====================
+        def _build_deep_tab(self):
+            info = mk_card(self.tab_deep, "深度清理说明",
+                           note="以下操作会先弹确认框，UAC 授权后才会执行",
+                           top_accent=True)
+            info.pack(fill="x", padx=SP["m"], pady=(SP["m"], SP["s"]))
+            tk.Label(info.body,
+                     text="这一页处理普通清理动不了的「空间大头」：系统组件备份、休眠文件。"
+                          "每一步都由你确认后执行，随时可以取消。",
+                     bg=CARD, fg=SUB, font=FONT_S, wraplength=920,
+                     justify="left").pack(anchor="w")
+
+            # ---- WinSxS 组件存储清理 ----
+            c1 = mk_card(self.tab_deep, "Windows 组件存储清理（WinSxS）")
+            c1.pack(fill="x", padx=SP["m"], pady=SP["s"])
+            tk.Label(c1.body,
+                     text="调用微软官方 DISM 清理过期的系统组件备份（Windows 更新残留），"
+                          "通常可释放几个 GB。过程约 5~15 分钟，会弹出黑色命令行窗口显示进度，"
+                          "跑完前请不要关机。",
+                     bg=CARD, fg=SUB, font=FONT_S, wraplength=920,
+                     justify="left").pack(anchor="w")
+            mk_btn(c1.body, "启动 DISM 组件清理", self.deep_winsxs,
+                   w=13).pack(anchor="w", pady=(SP["m"], 0))
+
+            # ---- 休眠文件 ----
+            c2 = mk_card(self.tab_deep, "休眠文件 hiberfil.sys")
+            c2.pack(fill="x", padx=SP["m"], pady=SP["s"])
+            tk.Label(c2.body,
+                     text="Windows 的休眠 / 快速启动功能会在 C 盘根目录放一个和内存差不多大的"
+                          "隐藏文件（8GB 内存 ≈ 3~6GB 占用）。如果你从不用「休眠」，"
+                          "可以关闭它直接释放空间，之后随时可以重新开启。",
+                     bg=CARD, fg=SUB, font=FONT_S, wraplength=920,
+                     justify="left").pack(anchor="w")
+            self._hiber_sz = None
+            self.deep_hiber = tk.Label(c2.body, text="当前状态：检测中…",
+                                       bg=CARD, fg=INK, font=FONT_B)
+            self.deep_hiber.pack(anchor="w", pady=(SP["s"], 0))
+            row2 = tk.Frame(c2.body, bg=CARD)
+            row2.pack(fill="x", pady=(SP["s"], 0))
+            mk_btn(row2, "关闭休眠并释放空间", self.deep_hiber_off, bg=DANGER,
+                   w=13).pack(side="left")
+            mk_btn2(row2, "重新开启休眠", self.deep_hiber_on,
+                    w=11).pack(side="left", padx=(SP["s"], 0))
+
+            # ---- 系统磁盘清理向导 ----
+            c3 = mk_card(self.tab_deep, "Windows 磁盘清理向导")
+            c3.pack(fill="x", padx=SP["m"], pady=(SP["s"], SP["m"]))
+            tk.Label(c3.body,
+                     text="打开系统自带的「磁盘清理」，可处理系统缩略图、旧版 Windows"
+                          "（Windows.old）等系统级垃圾，与本工具互不冲突。",
+                     bg=CARD, fg=SUB, font=FONT_S, wraplength=920,
+                     justify="left").pack(anchor="w")
+            mk_btn2(c3.body, "打开系统磁盘清理", self.deep_cleanmgr,
+                    w=13).pack(anchor="w", pady=(SP["m"], 0))
+
+        def _refresh_deep(self):
+            """后台查询休眠文件状态，回主线程刷新标签（避免卡界面）。"""
+            def _work():
+                sz = get_hiberfil_size()
+                self._hiber_sz = sz
+                txt = ("当前状态：休眠已开启，hiberfil.sys 占用 %s" % fmt_size(sz)
+                       if sz > 0 else "当前状态：休眠已关闭（无占用）")
+                self.root.after(0, lambda: self.deep_hiber.config(text=txt))
+            threading.Thread(target=_work, daemon=True).start()
+
+        def deep_winsxs(self):
+            if not messagebox.askyesno(
+                    "确认", "将启动微软官方 DISM 组件清理（WinSxS）：\n\n"
+                            "· 需要在弹出的管理员授权窗口点「是」\n"
+                            "· 过程约 5~15 分钟，请勿关机\n\n是否继续？",
+                    icon="warning"):
+                return
+            # cmd /k 让窗口在 DISM 跑完后保留，用户能看到清理结果
+            ok, msg = run_elevated_cmd(
+                "cmd.exe",
+                "/k dism.exe /Online /Cleanup-Image /StartComponentCleanup /NoRestart")
+            if ok:
+                self.set_status("DISM 组件清理已启动，请在弹出的黑色窗口查看进度")
+            else:
+                messagebox.showwarning("启动失败", msg or "未知错误")
+
+        def deep_hiber_off(self):
+            sz = self._hiber_sz
+            if sz is None:
+                sz = get_hiberfil_size()
+            if sz <= 0:
+                messagebox.showinfo("提示", "休眠当前就是关闭状态，没有可释放的 hiberfil.sys。")
+                return
+            if not messagebox.askyesno(
+                    "确认", "hiberfil.sys 当前占用 %s。\n\n"
+                            "关闭后「休眠」和「快速启动」将不可用（正常开关机不受影响），"
+                            "随时可以再开启。\n\n将在 UAC 授权后执行，是否继续？"
+                            % fmt_size(sz), icon="warning"):
+                return
+            ok, msg = run_elevated_cmd("powercfg", "-h off")
+            if ok:
+                self.set_status("休眠已关闭，hiberfil.sys 将在重启后完全释放")
+                messagebox.showinfo("完成", "命令已执行。hiberfil.sys 会在下次重启后彻底释放。")
+            else:
+                messagebox.showwarning("执行失败", msg or "未知错误")
+            self._refresh_deep()
+
+        def deep_hiber_on(self):
+            ok, msg = run_elevated_cmd("powercfg", "-h on")
+            if ok:
+                self.set_status("休眠已重新开启")
+            else:
+                messagebox.showwarning("执行失败", msg or "未知错误")
+            self._refresh_deep()
+
+        def deep_cleanmgr(self):
+            try:
+                subprocess.Popen(["cleanmgr", "/d", "C:"])
+                self.set_status("已打开 Windows 磁盘清理向导")
+            except Exception as e:  # noqa
+                messagebox.showwarning("无法打开", str(e))
+
     root = tk.Tk()
 
     # —— 环境运行库自检：在构建主界面之前，遇缺失先弹窗声明 ——
@@ -3342,14 +3528,14 @@ def start_gui(smoke=False):
     _install_styles()          # 必须在 Tk 根窗口创建之后，否则 Style 会隐式再建一个根
     app = App(root)
 
-    # 启动页可指定：CCD_START_TAB=0..4
+    # 启动页可指定：CCD_START_TAB=0..5
     # 供截图 / 自动化流程直接定位到某一页，无需模拟鼠标点击
     # （Tk 不响应进程内注入的鼠标消息，模拟点击在无交互会话里不可靠）。
     try:
         _t0 = int(os.environ.get("CCD_START_TAB", ""))
     except (TypeError, ValueError):
         _t0 = -1
-    if 0 <= _t0 <= 4:
+    if 0 <= _t0 <= 5:
         app.tabs.select(_t0)
 
     if not smoke:
@@ -3524,12 +3710,12 @@ def start_gui(smoke=False):
                                  "blue_t", "cyan", "ink", "text", "sub", "muted",
                                  "danger", "danger_d", "warnbg", "success",
                                  "sh1", "sh2")))
-        ck("五个标签页建立（自绘页面栈）", lambda: len(app.stack.pages()) == 5)
+        ck("六个标签页建立（自绘页面栈）", lambda: len(app.stack.pages()) == 6)
         ck("页面栈取代 Notebook（界面内不存在原生标签条）",
            lambda: isinstance(app.stack, TabStack)
            and not _find_widgets(root, ttk.Notebook))
-        ck("药丸导航 5 段",
-           lambda: len(app.tabs._items) == 5)
+        ck("药丸导航 6 段",
+           lambda: len(app.tabs._items) == 6)
         ck("药丸导航可切换页面（PillTabs 与页面栈同步）",
            lambda: (app.tabs.select(2),
                     app.stack.current() == 2 and app.tabs.current() == 2)[1])
@@ -3584,6 +3770,13 @@ def start_gui(smoke=False):
                        if isinstance(w, ttk.Scrollbar)))
         ck("自动清理页使用统一样式勾选框（FreshCheck）",
            lambda: len(_find_widgets(app.tab_auto, FreshCheck)) >= 4)
+        def _deep_tab_widgets():
+            btns = _find_widgets(app.tab_deep, PillButton)
+            labels = " ".join(str(w.cget("text"))
+                              for w in _find_widgets(app.tab_deep, tk.Label))
+            return len(btns) >= 3 and "DISM" in labels and "hiberfil" in labels
+
+        ck("深度清理页三个入口就绪（DISM / 休眠 / 磁盘清理）", _deep_tab_widgets)
         ck("排除页保留路径列表可增删",
            lambda: (app.ex_path_entry.insert(0, "D:\\__smoke__"),
                     app.ex_add_path(),
